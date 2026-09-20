@@ -18,6 +18,14 @@ Multi-document attribution (``attribute_quotes``) reuses the same
 normalization and fuzzy candidate enumeration, but ranks selections by
 located count, total edit distance, then the lexicographically smallest
 (document index, start, end) sequence.
+
+Excerpt alignment (``align_quote_excerpts``) locates ordered excerpts:
+each excerpt pairs a list of fragments with a ``max_gap``. A feasible
+combination picks one exact-match span per fragment, in fragment order,
+without overlap, leaving at most ``max_gap`` original characters between
+adjacent fragments. Selection across excerpts ranks by located count,
+total characters omitted inside excerpts, characters skipped between
+excerpts, then the lexicographically smallest fragment-span sequence.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from __future__ import annotations
 import re
 import sys
 from functools import lru_cache
+from typing import NamedTuple
 
 _WS_RUN = re.compile(r"\s+")
 
@@ -358,3 +367,178 @@ def align_quotes_fuzzy(
         for quote, max_edits in quotes
     ]
     return _select_spans(candidates)
+
+
+class ExcerptMatch(NamedTuple):
+    """One located excerpt: outer span, per-fragment spans, omitted ranges.
+
+    All offsets refer to the original text (ends exclusive). ``omitted_ranges``
+    holds the non-empty ranges skipped between adjacent fragments.
+    """
+
+    start: int
+    end: int
+    fragment_spans: tuple[tuple[int, int], ...]
+    omitted_ranges: tuple[tuple[int, int], ...]
+
+
+def _excerpt_combinations(
+    per_fragment: list[list[tuple[int, int]]], max_gap: int
+) -> list[tuple[int, int, int, tuple[tuple[int, int], ...]]]:
+    """All feasible fragment-span combinations for one excerpt.
+
+    ``per_fragment`` holds the sorted exact-match spans of every fragment.
+    A combination picks one span per fragment so that spans keep the
+    fragment order, do not overlap, and leave at most ``max_gap`` original
+    characters between adjacent fragments. Each result is a ``(start, end,
+    omitted, fragment_spans)`` tuple: the outer span, the total original
+    characters skipped between the fragments, and the fragment spans.
+    Combinations sharing an outer span keep only the one with the fewest
+    omitted characters (ties: earliest fragment spans).
+    """
+    if not per_fragment or any(not spans for spans in per_fragment):
+        return []
+
+    best_by_outer: dict[
+        tuple[int, int], tuple[int, tuple[tuple[int, int], ...]]
+    ] = {}
+    combo: list[tuple[int, int]] = []
+
+    def rec(i: int, prev_end: int, omitted: int) -> None:
+        if i == len(per_fragment):
+            outer = (combo[0][0], combo[-1][1])
+            key = (omitted, tuple(combo))
+            if outer not in best_by_outer or key < best_by_outer[outer]:
+                best_by_outer[outer] = key
+            return
+        for start, end in per_fragment[i]:
+            if prev_end != -1:
+                if start < prev_end:
+                    continue
+                if start - prev_end > max_gap:
+                    break  # Sorted by start; later spans only get worse.
+            combo.append((start, end))
+            rec(
+                i + 1,
+                end,
+                omitted + (0 if prev_end == -1 else start - prev_end),
+            )
+            combo.pop()
+
+    rec(0, -1, 0)
+    return sorted(
+        (outer[0], outer[1], omitted, spans)
+        for outer, (omitted, spans) in best_by_outer.items()
+    )
+
+
+def _select_excerpt_spans(
+    candidates: list[list[tuple[int, int, int, tuple[tuple[int, int], ...]]]],
+) -> list[tuple[int, int, int, tuple[tuple[int, int], ...]] | None]:
+    """Jointly pick at most one combination per excerpt.
+
+    ``candidates[i]`` holds the feasible ``(start, end, omitted,
+    fragment_spans)`` combinations for excerpt ``i``, sorted by offset.
+    Returns one combination (or ``None``) per excerpt. Selection ranks by
+    located count, then total characters omitted inside excerpts, then
+    skipped original characters between excerpts, then the
+    lexicographically smallest fragment-span sequence.
+    """
+    n = len(candidates)
+
+    def rank(option: tuple[int, int, int, tuple]) -> tuple:
+        count, omitted, skip, seq = option
+        return (-count, omitted, skip, seq)
+
+    @lru_cache(maxsize=None)
+    def dp(i: int, prev_end: int) -> tuple[int, int, int, tuple]:
+        # Best (located_count, total_omitted, skipped_chars, span_sequence)
+        # for excerpts[i:], given the previously located excerpt ends at
+        # prev_end (-1: none yet).
+        if i == n:
+            return (0, 0, 0, ())
+
+        best = None
+        for start, end, omitted, spans in candidates[i]:
+            if prev_end != -1 and start < prev_end:
+                continue
+            count, rest_omitted, skip, seq = dp(i + 1, end)
+            gap = 0 if prev_end == -1 else start - prev_end
+            option = (
+                count + 1,
+                rest_omitted + omitted,
+                skip + gap,
+                (spans,) + seq,
+            )
+            if best is None or rank(option) < rank(best):
+                best = option
+
+        # Leave excerpt i unlocated.
+        option = dp(i + 1, prev_end)
+        if best is None or rank(option) < rank(best):
+            best = option
+        return best
+
+    # Reconstruct which combination (if any) realizes the optimum.
+    result: list[tuple[int, int, int, tuple[tuple[int, int], ...]] | None] = [
+        None
+    ] * n
+    prev_end = -1
+    for i in range(n):
+        best = dp(i, prev_end)
+        for start, end, omitted, spans in candidates[i]:
+            if prev_end != -1 and start < prev_end:
+                continue
+            count, rest_omitted, skip, seq = dp(i + 1, end)
+            gap = 0 if prev_end == -1 else start - prev_end
+            if (
+                count + 1,
+                rest_omitted + omitted,
+                skip + gap,
+                (spans,) + seq,
+            ) == best:
+                result[i] = (start, end, omitted, spans)
+                prev_end = end
+                break
+    return result
+
+
+def align_quote_excerpts(
+    text: str, excerpts: list[tuple[list[str], int]]
+) -> list[ExcerptMatch | None]:
+    """Locate every excerpt in ``text`` as an ordered fragment sequence.
+
+    ``excerpts`` is a list of ``(fragments, max_gap)`` pairs; each fragment
+    is matched exactly (whitespace-insensitively) and the chosen fragment
+    spans must keep their order, not overlap, and leave at most ``max_gap``
+    original characters between adjacent fragments. Returns a list parallel
+    to ``excerpts``; each entry is an ``ExcerptMatch`` with the outer span,
+    the per-fragment spans, and the non-empty ranges omitted between
+    fragments — all offsets into the original text — or ``None`` when the
+    excerpt could not be located.
+    """
+    norm_text, norm_to_orig = _normalize_with_map(text)
+    candidates = [
+        _excerpt_combinations(
+            [
+                _candidate_spans(norm_text, norm_to_orig, fragment)
+                for fragment in fragments
+            ],
+            max_gap,
+        )
+        for fragments, max_gap in excerpts
+    ]
+    selected = _select_excerpt_spans(candidates)
+    results: list[ExcerptMatch | None] = []
+    for combination in selected:
+        if combination is None:
+            results.append(None)
+            continue
+        start, end, _, spans = combination
+        omitted_ranges = tuple(
+            (spans[i][1], spans[i + 1][0])
+            for i in range(len(spans) - 1)
+            if spans[i + 1][0] > spans[i][1]
+        )
+        results.append(ExcerptMatch(start, end, spans, omitted_ranges))
+    return results

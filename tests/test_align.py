@@ -2,7 +2,12 @@
 
 from fastapi.testclient import TestClient
 
-from app.align import align_quotes, align_quotes_fuzzy, attribute_quotes
+from app.align import (
+    align_quote_excerpts,
+    align_quotes,
+    align_quotes_fuzzy,
+    attribute_quotes,
+)
 from app.main import app
 
 client = TestClient(app)
@@ -433,5 +438,243 @@ def test_attribute_endpoint_rejects_max_edits_above_two():
             ],
             "quotes": [{"text": "hallo", "max_edits": 3}],
         },
+    )
+    assert resp.status_code == 422
+
+
+# --- core: ordered excerpts -------------------------------------------------
+
+
+def test_excerpt_basic_match_with_omitted_range():
+    assert align_quote_excerpts(
+        "alpha beta gamma", [(["alpha", "gamma"], 10)]
+    ) == [(0, 16, ((0, 5), (11, 16)), ((5, 11),))]
+
+
+def test_excerpt_whitespace_collapsed_but_original_offsets():
+    text = "a  b\t\nc  d"
+    # Fragments match across whitespace runs; spans and gaps refer to the
+    # original raw characters.
+    assert align_quote_excerpts(text, [(["a b c", "d"], 2)]) == [
+        (0, 10, ((0, 7), (9, 10)), ((7, 9),))
+    ]
+
+
+def test_excerpt_gap_counts_original_characters():
+    # The whitespace run between the fragments is 3 original characters.
+    assert align_quote_excerpts("a   b", [(["a", "b"], 3)]) == [
+        (0, 5, ((0, 1), (4, 5)), ((1, 4),))
+    ]
+    assert align_quote_excerpts("a   b", [(["a", "b"], 2)]) == [None]
+
+
+def test_excerpt_max_gap_excludes_distant_fragments():
+    text = "ab" + "." * 10 + "ab"  # "ab" at (0, 2) and (12, 14)
+    assert align_quote_excerpts(text, [(["ab", "ab"], 5)]) == [None]
+    assert align_quote_excerpts(text, [(["ab", "ab"], 10)]) == [
+        (0, 14, ((0, 2), (12, 14)), ((2, 12),))
+    ]
+
+
+def test_excerpt_zero_max_gap_requires_touching_fragments():
+    assert align_quote_excerpts("abcd", [(["ab", "cd"], 0)]) == [
+        (0, 4, ((0, 2), (2, 4)), ())
+    ]
+    assert align_quote_excerpts("ab cd", [(["ab", "cd"], 0)]) == [None]
+
+
+def test_excerpt_fragments_must_not_overlap():
+    # "aa" occurs at 0 and 1 in "aaa"; the two fragments cannot both fit.
+    assert align_quote_excerpts("aaa", [(["aa", "aa"], 1)]) == [None]
+    assert align_quote_excerpts("aaaa", [(["aa", "aa"], 0)]) == [
+        (0, 4, ((0, 2), (2, 4)), ())
+    ]
+
+
+def test_excerpt_three_fragments_keep_order():
+    assert align_quote_excerpts("a b c", [(["a", "b", "c"], 1)]) == [
+        (0, 5, ((0, 1), (2, 3), (4, 5)), ((1, 2), (3, 4)))
+    ]
+
+
+def test_excerpt_minimizes_internal_omitted_characters():
+    # Both combinations locate the excerpt; the tighter one wins.
+    text = "a  a b"
+    assert align_quote_excerpts(text, [(["a", "b"], 10)]) == [
+        (3, 6, ((3, 4), (5, 6)), ((4, 5),))
+    ]
+
+
+def test_excerpt_earliest_offsets_on_tie():
+    # Two symmetric zero-omission combinations; the earlier offsets win.
+    assert align_quote_excerpts("abXab", [(["a", "b"], 0)]) == [
+        (0, 2, ((0, 1), (1, 2)), ())
+    ]
+
+
+def test_excerpt_tie_breaks_on_earliest_fragment_spans():
+    # Same outer span and same omitted total; the earlier inner span wins.
+    assert align_quote_excerpts("a x x b", [(["a", "x", "b"], 5)]) == [
+        (0, 7, ((0, 1), (2, 3), (6, 7)), ((1, 2), (3, 6)))
+    ]
+
+
+def test_excerpt_unlocatable_returns_none_and_keeps_order():
+    text = "alpha omega"
+    excerpts = [(["alpha", "zzz"], 10), (["alpha", "omega"], 10)]
+    assert align_quote_excerpts(text, excerpts) == [
+        None,
+        (0, 11, ((0, 5), (6, 11)), ((5, 6),)),
+    ]
+
+
+def test_excerpt_blank_fragment_is_not_located():
+    assert align_quote_excerpts("some text", [(["some", "  "], 5)]) == [None]
+
+
+def test_excerpt_empty_array():
+    assert align_quote_excerpts("anything", []) == []
+
+
+# --- core: joint excerpt selection ------------------------------------------
+
+
+def test_excerpts_maximize_located_count():
+    text = "a b a b"
+    excerpts = [(["a", "b"], 5), (["a", "b"], 5)]
+    assert align_quote_excerpts(text, excerpts) == [
+        (0, 3, ((0, 1), (2, 3)), ((1, 2),)),
+        (4, 7, ((4, 5), (6, 7)), ((5, 6),)),
+    ]
+
+
+def test_excerpts_joint_count_beats_individual_best():
+    # Alone, each excerpt would take the zero-omission combination at
+    # (4, 6); jointly the only two-excerpt solution shifts the first one
+    # to its earlier, looser combination.
+    text = "a b ab"
+    excerpts = [(["a", "b"], 2), (["a", "b"], 2)]
+    assert align_quote_excerpts(text, excerpts) == [
+        (0, 3, ((0, 1), (2, 3)), ((1, 2),)),
+        (4, 6, ((4, 5), (5, 6)), ()),
+    ]
+
+
+def test_excerpts_minimize_internal_omission_before_skip():
+    # Only one excerpt fits; the tighter combination (omission 1) beats the
+    # earlier but looser one (omission 3).
+    text = "aXa b"
+    excerpts = [(["a", "b"], 3), (["a", "b"], 3)]
+    assert align_quote_excerpts(text, excerpts) == [
+        (2, 5, ((2, 3), (4, 5)), ((3, 4),)),
+        None,
+    ]
+
+
+def test_excerpts_minimize_skip_between_excerpts():
+    # All combinations omit 1 character internally; the pair skipping the
+    # fewest characters between excerpts wins.
+    text = "a b q a b q q a b"
+    excerpts = [(["a", "b"], 1), (["a", "b"], 1)]
+    assert align_quote_excerpts(text, excerpts) == [
+        (0, 3, ((0, 1), (2, 3)), ((1, 2),)),
+        (6, 9, ((6, 7), (8, 9)), ((7, 8),)),
+    ]
+
+
+# --- API: ordered excerpts ---------------------------------------------------
+
+
+def test_align_excerpts_endpoint():
+    resp = client.post(
+        "/quotes/align-excerpts",
+        json={
+            "text": "alpha  beta\ngamma delta epsilon zeta",
+            "excerpts": [
+                {"fragments": ["alpha beta", "gamma"], "max_gap": 5},
+                {"fragments": ["delta", "zeta"], "max_gap": 20},
+                {"fragments": ["absent", "zeta"], "max_gap": 5},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "results": [
+            {
+                "start": 0,
+                "end": 17,
+                "fragment_spans": [
+                    {"start": 0, "end": 11},
+                    {"start": 12, "end": 17},
+                ],
+                "omitted_ranges": [{"start": 11, "end": 12}],
+            },
+            {
+                "start": 18,
+                "end": 36,
+                "fragment_spans": [
+                    {"start": 18, "end": 23},
+                    {"start": 32, "end": 36},
+                ],
+                "omitted_ranges": [{"start": 23, "end": 32}],
+            },
+            None,
+        ]
+    }
+
+
+def test_align_excerpts_endpoint_accepts_boundary_max_gap():
+    for max_gap in (0, 10000):
+        resp = client.post(
+            "/quotes/align-excerpts",
+            json={
+                "text": "ab",
+                "excerpts": [{"fragments": ["a", "b"], "max_gap": max_gap}],
+            },
+        )
+        assert resp.status_code == 200
+
+
+def test_align_excerpts_endpoint_rejects_bad_fragment_counts():
+    for fragments in (["only"], ["a", "b", "c", "d", "e", "f"]):
+        resp = client.post(
+            "/quotes/align-excerpts",
+            json={
+                "text": "a b c d e f",
+                "excerpts": [{"fragments": fragments, "max_gap": 5}],
+            },
+        )
+        assert resp.status_code == 422
+
+
+def test_align_excerpts_endpoint_rejects_blank_fragment():
+    resp = client.post(
+        "/quotes/align-excerpts",
+        json={
+            "text": "a b",
+            "excerpts": [{"fragments": ["a", "  "], "max_gap": 5}],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_align_excerpts_endpoint_rejects_out_of_range_max_gap():
+    for max_gap in (-1, 10001):
+        resp = client.post(
+            "/quotes/align-excerpts",
+            json={
+                "text": "a b",
+                "excerpts": [{"fragments": ["a", "b"], "max_gap": max_gap}],
+            },
+        )
+        assert resp.status_code == 422
+
+
+def test_align_excerpts_endpoint_rejects_missing_fields():
+    resp = client.post("/quotes/align-excerpts", json={"text": "a b"})
+    assert resp.status_code == 422
+    resp = client.post(
+        "/quotes/align-excerpts",
+        json={"text": "a b", "excerpts": [{"fragments": ["a", "b"]}]},
     )
     assert resp.status_code == 422
