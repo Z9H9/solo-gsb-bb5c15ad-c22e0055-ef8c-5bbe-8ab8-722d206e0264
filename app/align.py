@@ -18,12 +18,22 @@ Multi-document attribution (``attribute_quotes``) reuses the same
 normalization and fuzzy candidate enumeration, but ranks selections by
 located count, total edit distance, then the lexicographically smallest
 (document index, start, end) sequence.
+
+Excerpt alignment (``align_excerpts``) locates ordered chains of
+fragments: every excerpt contributes a handful of fragments that must
+appear in order without overlapping, leaving at most ``max_gap`` original
+characters between adjacent fragments. Feasible fragment combinations are
+enumerated per excerpt, then selected jointly across excerpts by located
+count, total characters omitted inside excerpts, characters skipped
+between excerpts, and finally the lexicographically smallest offset
+sequence.
 """
 
 from __future__ import annotations
 
 import re
 import sys
+from bisect import bisect_left, bisect_right
 from functools import lru_cache
 
 _WS_RUN = re.compile(r"\s+")
@@ -239,6 +249,132 @@ def align_quotes(text: str, quotes: list[str]) -> list[tuple[int, int] | None]:
     return [
         None if span is None else (span[0], span[1]) for span in selected
     ]
+
+
+def _excerpt_combinations(
+    fragment_candidates: list[list[tuple[int, int]]], max_gap: int
+) -> list[tuple[int, int, int, tuple[tuple[int, int], ...]]]:
+    """All feasible fragment-span combinations for one excerpt.
+
+    ``fragment_candidates[j]`` holds the sorted original-text spans where
+    fragment ``j`` may be located. A combination picks one span per
+    fragment so that the spans keep fragment order, do not overlap, and
+    leave a gap of at most ``max_gap`` original characters between
+    adjacent fragments. Returns ``(start, end, omitted_chars,
+    fragment_spans)`` tuples, where ``start``/``end`` span the whole
+    excerpt and ``omitted_chars`` counts the original characters skipped
+    between adjacent fragments.
+    """
+    k = len(fragment_candidates)
+    starts = [
+        [start for start, _ in candidates]
+        for candidates in fragment_candidates
+    ]
+    chosen: list = [None] * k
+    combinations = []
+
+    def rec(j: int, prev_end: int) -> None:
+        if j == k:
+            fragment_spans = tuple(chosen)
+            omitted = sum(
+                fragment_spans[i + 1][0] - fragment_spans[i][1]
+                for i in range(k - 1)
+            )
+            combinations.append(
+                (
+                    fragment_spans[0][0],
+                    fragment_spans[-1][1],
+                    omitted,
+                    fragment_spans,
+                )
+            )
+            return
+        candidates = fragment_candidates[j]
+        # Feasible starts lie in [prev_end, prev_end + max_gap]; the sorted
+        # candidate list lets us jump straight to that window.
+        lo = 0 if prev_end == -1 else bisect_left(starts[j], prev_end)
+        hi = (
+            len(candidates)
+            if prev_end == -1
+            else bisect_right(starts[j], prev_end + max_gap)
+        )
+        for index in range(lo, hi):
+            chosen[j] = candidates[index]
+            rec(j + 1, candidates[index][1])
+
+    rec(0, -1)
+    return combinations
+
+
+def align_excerpts(
+    text: str, excerpts: list[tuple[list[str], int]]
+) -> list[
+    tuple[int, int, tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]
+    | None
+]:
+    """Locate every excerpt in ``text`` as an ordered chain of fragments.
+
+    ``excerpts`` is a list of ``(fragments, max_gap)`` pairs. Each fragment
+    is matched exactly (whitespace-insensitively); the fragments of an
+    excerpt must appear in order, without overlapping, leaving a gap of at
+    most ``max_gap`` original characters between adjacent fragments.
+    Returns a list parallel to ``excerpts``; each entry is a ``(start,
+    end, fragment_spans, omitted_ranges)`` tuple of character offsets into
+    the original text (end-exclusive), or ``None`` when the excerpt could
+    not be located. ``omitted_ranges`` holds the non-empty ranges skipped
+    between adjacent fragments.
+
+    Excerpts are located jointly: the chosen combinations must not overlap
+    and must keep the excerpt array order. Among all feasible selections we
+
+    1. maximize the number of located excerpts,
+    2. minimize the total characters omitted inside the located excerpts,
+    3. minimize the total characters skipped between located excerpts
+       (characters before the first / after the last located excerpt do
+       not count),
+    4. take the lexicographically smallest offset sequence.
+    """
+    norm_text, norm_to_orig = _normalize_with_map(text)
+    candidates = []
+    combo_maps = []
+    for fragments, max_gap in excerpts:
+        fragment_candidates = [
+            _candidate_spans(norm_text, norm_to_orig, fragment)
+            for fragment in fragments
+        ]
+        # Combinations sharing the same outer span are interchangeable for
+        # the joint selection except for their omitted count and inner
+        # offsets, so keep only the cheapest (then earliest) one.
+        best_by_outer: dict[tuple[int, int], tuple[int, tuple]] = {}
+        for start, end, omitted, fragment_spans in _excerpt_combinations(
+            fragment_candidates, max_gap
+        ):
+            current = best_by_outer.get((start, end))
+            if current is None or (omitted, fragment_spans) < current:
+                best_by_outer[(start, end)] = (omitted, fragment_spans)
+        per_excerpt = []
+        combo_map = {}
+        for start, end in sorted(best_by_outer):
+            omitted, fragment_spans = best_by_outer[(start, end)]
+            per_excerpt.append((start, end, omitted))
+            combo_map[(start, end, omitted)] = fragment_spans
+        candidates.append(per_excerpt)
+        combo_maps.append(combo_map)
+
+    selected = _select_spans(candidates)
+    results = []
+    for span, combo_map in zip(selected, combo_maps):
+        if span is None:
+            results.append(None)
+            continue
+        fragment_spans = combo_map[span]
+        omitted_ranges = tuple(
+            (fragment_spans[i][1], fragment_spans[i + 1][0])
+            for i in range(len(fragment_spans) - 1)
+            if fragment_spans[i + 1][0] > fragment_spans[i][1]
+        )
+        results.append((span[0], span[1], fragment_spans, omitted_ranges))
+    return results
 
 
 def _select_spans_across_documents(

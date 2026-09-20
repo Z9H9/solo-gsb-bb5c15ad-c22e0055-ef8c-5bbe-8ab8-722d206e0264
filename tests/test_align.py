@@ -2,7 +2,12 @@
 
 from fastapi.testclient import TestClient
 
-from app.align import align_quotes, align_quotes_fuzzy, attribute_quotes
+from app.align import (
+    align_excerpts,
+    align_quotes,
+    align_quotes_fuzzy,
+    attribute_quotes,
+)
 from app.main import app
 
 client = TestClient(app)
@@ -126,6 +131,251 @@ def test_align_endpoint():
 
 def test_align_endpoint_rejects_bad_payload():
     resp = client.post("/quotes/align", json={"text": "x"})
+    assert resp.status_code == 422
+
+
+# --- core: excerpt alignment -----------------------------------------------
+
+
+def test_excerpts_basic_chain_with_omitted_ranges():
+    text = "alpha beta gamma delta"
+    assert align_excerpts(text, [(["alpha", "gamma"], 10)]) == [
+        (0, 16, ((0, 5), (11, 16)), ((5, 11),))
+    ]
+    assert text[5:11] == " beta "
+
+
+def test_excerpts_max_gap_exceeded_not_located():
+    text = "alpha beta gamma delta"
+    # The gap between "alpha" and "delta" is 12 original characters.
+    assert align_excerpts(text, [(["alpha", "delta"], 5)]) == [None]
+
+
+def test_excerpts_max_gap_boundary_is_inclusive():
+    text = "alpha beta gamma delta"
+    assert align_excerpts(text, [(["alpha", "delta"], 12)]) == [
+        (0, 22, ((0, 5), (17, 22)), ((5, 17),))
+    ]
+
+
+def test_excerpts_zero_max_gap_requires_touching_fragments():
+    assert align_excerpts("aXb ab", [(["a", "b"], 0)]) == [
+        (4, 6, ((4, 5), (5, 6)), ())
+    ]
+
+
+def test_excerpts_whitespace_collapsed_but_original_offsets():
+    text = "a\n\nb  c"
+    # "a b" matches across the newline run; the gap to "c" covers the two
+    # original spaces at offsets 4-5.
+    assert align_excerpts(text, [(["a b", "c"], 5)]) == [
+        (0, 7, ((0, 4), (6, 7)), ((4, 6),))
+    ]
+
+
+def test_excerpts_fragments_keep_order_and_do_not_overlap():
+    # "aa" occurs at 0 and 1 in "aaa"; two copies cannot chain without
+    # overlapping.
+    assert align_excerpts("aaa", [(["aa", "aa"], 10)]) == [None]
+    # Fragments match in array order, not in order of appearance; touching
+    # fragments leave no omitted range.
+    assert align_excerpts("ab ba", [(["b", "a"], 10)]) == [
+        (3, 5, ((3, 4), (4, 5)), ())
+    ]
+
+
+def test_excerpts_minimize_internal_omitted_chars():
+    # Three feasible chains omit 1, 6 and 2 characters; the first wins.
+    text = "aXb aXXb"
+    assert align_excerpts(text, [(["a", "b"], 10)]) == [
+        (0, 3, ((0, 1), (2, 3)), ((1, 2),))
+    ]
+
+
+def test_excerpts_five_fragments_chain():
+    text = "a b c d e"
+    assert align_excerpts(text, [(["a", "b", "c", "d", "e"], 1)]) == [
+        (
+            0,
+            9,
+            ((0, 1), (2, 3), (4, 5), (6, 7), (8, 9)),
+            ((1, 2), (3, 4), (5, 6), (7, 8)),
+        )
+    ]
+
+
+def test_excerpts_unlocatable_fragment_means_unlocatable_excerpt():
+    assert align_excerpts("some text", [(["some", "zzz"], 100)]) == [None]
+
+
+def test_excerpts_empty_excerpt_array():
+    assert align_excerpts("anything", []) == []
+
+
+# --- core: excerpt joint selection ------------------------------------------
+
+
+def test_excerpts_joint_selection_maximizes_located_count():
+    text = "a b a b"
+    assert align_excerpts(text, [(["a", "b"], 10), (["a", "b"], 10)]) == [
+        (0, 3, ((0, 1), (2, 3)), ((1, 2),)),
+        (4, 7, ((4, 5), (6, 7)), ((5, 6),)),
+    ]
+
+
+def test_excerpts_located_count_dominates_omitted_chars():
+    # Locating both excerpts costs 2+1 omitted characters; locating only the
+    # second chain would cost 1. Count wins.
+    text = "aXXb a b"
+    assert align_excerpts(text, [(["a", "b"], 10), (["a", "b"], 10)]) == [
+        (0, 4, ((0, 1), (3, 4)), ((1, 3),)),
+        (5, 8, ((5, 6), (7, 8)), ((6, 7),)),
+    ]
+
+
+def test_excerpts_minimize_skipped_chars_between_excerpts():
+    # The first excerpt has two chains omitting 1 character each; the one
+    # closer to the second excerpt skips fewer characters between excerpts.
+    text = "aXb aXb cXd"
+    assert align_excerpts(text, [(["a", "b"], 10), (["c", "d"], 10)]) == [
+        (4, 7, ((4, 5), (6, 7)), ((5, 6),)),
+        (8, 11, ((8, 9), (10, 11)), ((9, 10),)),
+    ]
+
+
+def test_excerpts_earliest_offsets_on_tie():
+    text = "aXb aXb"
+    assert align_excerpts(text, [(["a", "b"], 10)]) == [
+        (0, 3, ((0, 1), (2, 3)), ((1, 2),))
+    ]
+
+
+def test_excerpts_earliest_inner_spans_on_full_tie():
+    # Both chains span (0, 9) and omit 5 characters; the one whose inner
+    # fragments start earlier wins.
+    text = "a bcXbc d"
+    assert align_excerpts(text, [(["a", "bc", "d"], 10)]) == [
+        (0, 9, ((0, 1), (2, 4), (8, 9)), ((1, 2), (4, 8)))
+    ]
+
+
+def test_excerpts_unlocatable_excerpt_does_not_break_order():
+    text = "alpha beta gamma omega"
+    assert align_excerpts(
+        text,
+        [
+            (["alpha", "beta"], 2),
+            (["zzz", "yyy"], 10),
+            (["gamma", "omega"], 2),
+        ],
+    ) == [
+        (0, 10, ((0, 5), (6, 10)), ((5, 6),)),
+        None,
+        (11, 22, ((11, 16), (17, 22)), ((16, 17),)),
+    ]
+
+
+# --- API: excerpt alignment --------------------------------------------------
+
+
+def test_align_excerpts_endpoint():
+    resp = client.post(
+        "/quotes/align-excerpts",
+        json={
+            "text": "Archive  text\nwith repeats. Archive text.",
+            "excerpts": [
+                {"fragments": ["Archive text", "repeats"], "max_gap": 20},
+                {"fragments": ["Archive text", "repeats"], "max_gap": 0},
+                {"fragments": ["absent", "text"], "max_gap": 100},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "results": [
+            {
+                "start": 0,
+                "end": 26,
+                "fragment_spans": [
+                    {"start": 0, "end": 13},
+                    {"start": 19, "end": 26},
+                ],
+                "omitted_ranges": [{"start": 13, "end": 19}],
+            },
+            None,
+            None,
+        ]
+    }
+
+
+def test_align_excerpts_endpoint_empty_excerpt_array():
+    resp = client.post(
+        "/quotes/align-excerpts", json={"text": "anything", "excerpts": []}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"results": []}
+
+
+def test_align_excerpts_endpoint_accepts_boundary_values():
+    resp = client.post(
+        "/quotes/align-excerpts",
+        json={
+            "text": "a b c d e",
+            "excerpts": [
+                {"fragments": ["a", "b"], "max_gap": 0},
+                {
+                    "fragments": ["a", "b", "c", "d", "e"],
+                    "max_gap": 10000,
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200
+
+
+def test_align_excerpts_endpoint_rejects_bad_fragment_counts():
+    for fragments in (["only"], ["a", "b", "c", "d", "e", "f"]):
+        resp = client.post(
+            "/quotes/align-excerpts",
+            json={
+                "text": "a b",
+                "excerpts": [{"fragments": fragments, "max_gap": 1}],
+            },
+        )
+        assert resp.status_code == 422
+
+
+def test_align_excerpts_endpoint_rejects_blank_fragments():
+    for fragment in ("", "   "):
+        resp = client.post(
+            "/quotes/align-excerpts",
+            json={
+                "text": "a b",
+                "excerpts": [{"fragments": ["a", fragment], "max_gap": 1}],
+            },
+        )
+        assert resp.status_code == 422
+
+
+def test_align_excerpts_endpoint_rejects_max_gap_out_of_range():
+    for max_gap in (-1, 10001):
+        resp = client.post(
+            "/quotes/align-excerpts",
+            json={
+                "text": "a b",
+                "excerpts": [{"fragments": ["a", "b"], "max_gap": max_gap}],
+            },
+        )
+        assert resp.status_code == 422
+
+
+def test_align_excerpts_endpoint_rejects_missing_fields():
+    resp = client.post("/quotes/align-excerpts", json={"text": "a b"})
+    assert resp.status_code == 422
+    resp = client.post(
+        "/quotes/align-excerpts",
+        json={"text": "a b", "excerpts": [{"fragments": ["a", "b"]}]},
+    )
     assert resp.status_code == 422
 
 

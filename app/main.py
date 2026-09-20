@@ -5,12 +5,13 @@ from pydantic import BaseModel, Field, field_validator
 
 from .align import (
     MAX_ALLOWED_EDITS,
+    align_excerpts,
     align_quotes,
     align_quotes_fuzzy,
     attribute_quotes,
 )
 
-app = FastAPI(title="Archive Quote Alignment API", version="1.2.0")
+app = FastAPI(title="Archive Quote Alignment API", version="1.3.0")
 
 
 class AlignRequest(BaseModel):
@@ -34,6 +35,38 @@ class FuzzyAlignRequest(BaseModel):
     text: str = Field(..., description="Original source text")
     quotes: list[FuzzyQuote] = Field(
         ..., description="Quotes to locate, matched in array order"
+    )
+
+
+class Excerpt(BaseModel):
+    fragments: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=5,
+        description="Ordered fragments of the excerpt (2-5, each non-blank)",
+    )
+    max_gap: int = Field(
+        ...,
+        ge=0,
+        le=10000,
+        description=(
+            "Maximum gap in original characters between adjacent "
+            "fragments (0-10000)"
+        ),
+    )
+
+    @field_validator("fragments")
+    @classmethod
+    def fragments_must_be_non_blank(cls, fragments: list[str]) -> list[str]:
+        if any(not fragment.strip() for fragment in fragments):
+            raise ValueError("fragments must be non-blank")
+        return fragments
+
+
+class AlignExcerptsRequest(BaseModel):
+    text: str = Field(..., description="Original source text")
+    excerpts: list[Excerpt] = Field(
+        ..., description="Excerpts to locate, matched in array order"
     )
 
 
@@ -104,6 +137,35 @@ class FuzzyAlignResponse(BaseModel):
     )
 
 
+class ExcerptAlignment(BaseModel):
+    start: int = Field(
+        ..., description="Start offset of the excerpt in the original text"
+    )
+    end: int = Field(
+        ...,
+        description=(
+            "End offset (exclusive) of the excerpt in the original text"
+        ),
+    )
+    fragment_spans: list[Span] = Field(
+        ..., description="Located span of each fragment, in fragment order"
+    )
+    omitted_ranges: list[Span] = Field(
+        ...,
+        description=(
+            "Non-empty original-text ranges omitted between adjacent "
+            "fragments"
+        ),
+    )
+
+
+class AlignExcerptsResponse(BaseModel):
+    results: list[ExcerptAlignment | None] = Field(
+        ...,
+        description="One entry per excerpt; null when the excerpt is not located",
+    )
+
+
 class AttributeResponse(BaseModel):
     results: list[Attribution | None] = Field(
         ..., description="One entry per quote; null when the quote is not attributed"
@@ -137,6 +199,33 @@ def align_fuzzy(request: FuzzyAlignRequest) -> FuzzyAlignResponse:
             if span is not None
             else None
             for span in spans
+        ]
+    )
+
+
+@app.post("/quotes/align-excerpts", response_model=AlignExcerptsResponse)
+def align_excerpts_endpoint(
+    request: AlignExcerptsRequest,
+) -> AlignExcerptsResponse:
+    aligned = align_excerpts(
+        request.text,
+        [(excerpt.fragments, excerpt.max_gap) for excerpt in request.excerpts],
+    )
+    return AlignExcerptsResponse(
+        results=[
+            ExcerptAlignment(
+                start=match[0],
+                end=match[1],
+                fragment_spans=[
+                    Span(start=start, end=end) for start, end in match[2]
+                ],
+                omitted_ranges=[
+                    Span(start=start, end=end) for start, end in match[3]
+                ],
+            )
+            if match is not None
+            else None
+            for match in aligned
         ]
     )
 
